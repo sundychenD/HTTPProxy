@@ -1,7 +1,7 @@
 import java.io.*;
 import java.net.ServerSocket;
 import java.net.Socket;
-import java.nio.ByteBuffer;
+import java.nio.charset.Charset;
 import java.util.LinkedList;
 import java.util.Scanner;
 
@@ -10,7 +10,7 @@ import java.util.Scanner;
  */
 
 /*
-* WebProxy is a simple HTTP proxy server.
+* WebProxy is a simple HTTPMSG proxy server.
 *
 * To run it, give a port number as input and it
 * would listen on that port for incoming http requests.
@@ -77,155 +77,143 @@ class ProxyThreadRunnable implements Runnable {
     public void run() {
         String input;
         try {
-
-            byte[] requestBuffer = new byte[10240];
             while (true) {
 
-                // Receive client request
-                BufferedInputStream buf_input = new BufferedInputStream(this.socket.getInputStream());
-                HTTP clientRequest = getClientRequest(buf_input);
+                // Receive client request, establish new socket to remote server
+                HTTPMSG clientReqMSG = formHTTPMSG(this.socket);
+                System.out.println("====== Client request: \n" + clientReqMSG.getHeader().getHeaderStr());
+                Socket serverSocket = new Socket(clientReqMSG.getHeader().getHost(), 80);
 
-                /*
-                int requestLength = buf_input.read(requestBuffer);
-                String browserRequest = new String(requestBuffer, 0, requestLength);
-                System.out.println("== Client request: \n" + browserRequest);
-
-                // Get remote server address
-                String host = getHost(browserRequest);
-                System.out.println("== Client wants to connect to host: " + host);
-
-                // Establish new socket to remote server
-                Socket hostSocket = new Socket(host, 80);
-                forwardRequest(requestBuffer, requestLength, hostSocket);
-                System.out.println("== Forwarding request to server");
+                // Send client request to remote server
+                System.out.println("====== Forwarding request to server");
+                forwardRequest(clientReqMSG, serverSocket);
 
                 // Transferring remote server responses back to client
-                BufferedInputStream forwardInputStream = new BufferedInputStream(hostSocket.getInputStream());
-                BufferedOutputStream clientOutputStream = new BufferedOutputStream(this.socket.getOutputStream());
-                returnResponse(forwardInputStream, clientOutputStream);
-                System.out.println("== Return server response");
+                BufferedInputStream forwardInputStream = new BufferedInputStream(serverSocket.getInputStream());
+                BufferedOutputStream serverResponse = new BufferedOutputStream(this.socket.getOutputStream());
+                returnResponse(forwardInputStream, serverResponse);
 
-                hostSocket.close();
-                */
-
-                this.socket.close();
+                //serverSocket.close();
+                //this.socket.close();
                 System.out.println("!== End of communication");
+
+                /*
+                if (cached(clientRequest)) {
+                    if (modified(clientRequest)) {
+                        // Original page updated, retrieve new page
+                        cacheResponse();
+                        forwardResponse();
+                    } else {
+                        // Original page not updated, return local cached response
+                        forwardResponse();
+                    }
+                } else {
+                    cacheResponse();
+                    forwardReponse();
+                }
+                */
             }
         } catch (IOException e) {
+            System.out.println(e.getMessage());
             System.out.println(e.getStackTrace());
         }
     }
 
     /*
-    * Read client request content into a byte buffer
+    * Forward clinet request to remote server;
     * */
-    private HTTP getClientRequest(BufferedInputStream input) {
+    private void forwardRequest(HTTPMSG clientReqMSG, Socket serverSocket) throws IOException {
+        Header clientReqHeader = clientReqMSG.getHeader();
+        Scanner bodyScanner = clientReqMSG.getBodyScanner();
+        BufferedOutputStream serverOutput = new BufferedOutputStream(serverSocket.getOutputStream());
 
-        HTTP HTTP;
-        String header = readHeader(input);
-        ByteBuffer content_byte = readContent(input);
+        // Send header in byte array
+        byte[] headerByteArray = clientReqHeader.getHeaderByte();
+        serverOutput.write(headerByteArray, 0, headerByteArray.length);
 
-        return new HTTP(header, content_byte);
+        // Send message body if request is POST type
+        if (clientReqHeader.isPost()) {
+            while (bodyScanner.hasNextByte()) {
+                serverOutput.write((int) bodyScanner.nextByte());
+            }
+        }
+        serverOutput.flush();
+    }
+
+    private HTTPMSG formHTTPMSG(Socket socket) throws IOException {
+        BufferedInputStream buf_input = new BufferedInputStream(socket.getInputStream());
+        Scanner sc = new Scanner(buf_input);
+        Header clientRequestHeader = new Header(readHeader(sc));
+        return new HTTPMSG(clientRequestHeader, sc);
     }
 
     /*
     * Read http header into String
     * */
-    private String readHeader(BufferedInputStream input) {
+    private String readHeader(Scanner input) {
         String header = "";
-        Scanner sc = new Scanner(input);
-
         String next;
-        while(!(next = sc.nextLine()).equals("")) {
+        while(!(next = input.nextLine()).trim().equals("")) {
             header += next + "\n";
         }
+        header += "\n";
 
         return header;
     }
 
     /*
-    * Read the content of the HTTP request into a byte buffer
-    * */
-    private ByteBuffer readContent(BufferedInputStream input) {
-        ByteBuffer content_byte = null;
-        byte[] input_buf = new byte[1024];
-
-        try {
-            while (input.available() > 0) {
-                input.read(input_buf);
-                content_byte.put(input_buf);
-            }
-        } catch (IOException e) {
-            System.out.println("Error read client request stream");
-            e.printStackTrace();
-        }
-
-        return content_byte;
-    }
-
-    /*
     * Return the remote server response to the client
     * */
-    private void returnResponse(BufferedInputStream serverResponse, BufferedOutputStream clientSocket) throws IOException {
+    private void returnResponse(BufferedInputStream serverResponse, BufferedOutputStream clientOutput) throws IOException {
         int numResponseBytes;
         byte[] buffer = new byte[1024];
 
         while ((numResponseBytes = serverResponse.read(buffer)) != -1) {
             System.out.println("Receiving from server" + numResponseBytes + " bytes");
-            clientSocket.write(buffer, 0, numResponseBytes);
+            clientOutput.write(buffer, 0, numResponseBytes);
         }
-        clientSocket.flush();
+        clientOutput.flush();
     }
-
-    /*
-    * Forward client request to remote server
-    * */
-    private void forwardRequest(byte[] requestBuffer, int buffer, Socket hostSocket) throws IOException {
-        BufferedOutputStream forwardSocket = new BufferedOutputStream(hostSocket.getOutputStream());
-        forwardSocket.write(requestBuffer, 0, buffer);
-        forwardSocket.flush();
-    }
-
 }
 
-
 /*
-* Client Request
-*
-* An abstraction of a client request
+* Header Class
 * */
-class HTTP {
-    private String header;
+class Header {
+    private String rawHeader;
     private LinkedList<String> headerList;
-    private ByteBuffer byte_content;
 
-    public HTTP(String header, ByteBuffer input) {
-        this.header = header;
-        this.headerList = headerToList(header);
-        this.byte_content = input;
+    public Header(String rawHeader) {
+        this.rawHeader = rawHeader;
+        this.headerList = headerToList(rawHeader);
     }
 
-    public String getHeader() {
-        return this.header;
+    public String getHeaderStr() {
+        return this.rawHeader;
     }
 
-    public ByteBuffer getContent() {
-        return this.byte_content;
+    /* Header in byte array */
+    public byte[] getHeaderByte() {
+        return this.rawHeader.getBytes(Charset.forName("UTF-8"));
+    }
+
+    public boolean isGet() {
+        return this.headerList.getFirst().toUpperCase().startsWith("GET");
+    }
+
+    public boolean isHead() {
+        return this.headerList.getFirst().toUpperCase().startsWith("HOST");
+    }
+
+    public boolean isPost() {
+        return this.headerList.getFirst().toUpperCase().startsWith("POST");
     }
 
     public String getHost() {
-        return retrieveHost();
-    }
-
-    public String getContentType() {
-        return retrieveContentType();
-    }
-
-    private String retrieveHost() {
         return getField("Host:");
     }
 
-    private String retrieveContentType() {
+    public String getContentType() {
         return getField("Content-Type:");
     }
 
@@ -256,5 +244,30 @@ class HTTP {
             headerList.add(headerArr[i]);
         }
         return headerList;
+    }
+}
+
+
+/*
+* Client Request
+*
+* An abstraction of a client request
+* */
+class HTTPMSG {
+
+    private Header header;
+    private Scanner bodyScanner;
+
+    public HTTPMSG(Header header, Scanner sc) {
+        this.header = header;
+        this.bodyScanner = sc;
+    }
+
+    public Header getHeader() {
+        return this.header;
+    }
+
+    public Scanner getBodyScanner() {
+        return this.bodyScanner;
     }
 }
