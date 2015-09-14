@@ -93,15 +93,15 @@ class ProxyThreadRunnable implements Runnable {
                 BufferedOutputStream serverResponse = new BufferedOutputStream(this.socket.getOutputStream());
                 returnResponse(forwardInputStream, serverResponse);
 
-                //serverSocket.close();
-                //this.socket.close();
+                serverSocket.close();
+                this.socket.close();
                 System.out.println("!== End of communication");
 
                 /*
                 if (cached(clientRequest)) {
                     if (modified(clientRequest)) {
                         // Original page updated, retrieve new page
-                        cacheResponse();
+                        cacheResponse();    
                         forwardResponse();
                     } else {
                         // Original page not updated, return local cached response
