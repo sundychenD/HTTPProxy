@@ -74,14 +74,14 @@ class ProxyThreadRunnable implements Runnable {
 
     private Socket socket;
     private HashMap<String, String> cache;
-    private BufferedOutputStream serverResponse;
+    private BufferedOutputStream clientResponse;
     private File cacheDir;
     private String[] censorWords;
 
     public ProxyThreadRunnable(Socket socket, HashMap<String, String> cache) throws IOException {
         this.socket = socket;
         this.cache = cache;
-        this.serverResponse = new BufferedOutputStream(socket.getOutputStream());
+        this.clientResponse = new BufferedOutputStream(socket.getOutputStream());
         this.cacheDir = new File("ProxyCachedFile");
         this.censorWords = readFromCensorFile();
 
@@ -102,31 +102,35 @@ class ProxyThreadRunnable implements Runnable {
                 // Connect to remote server
                 Socket serverSocket = new Socket(clientReqMSG.getHeader().getHost(), 80);
 
-                /*!! Should use server HTTP class instead of just output stream,
-                    need to retrieve info from response header */
-                // BufferedInputStream forwardInputStream = new BufferedInputStream(serverSocket.getInputStream());
-
                 // Check cache for GET requests
                 if (requestHeader.isGet()) {
                     if (isCached(requestAddr) && notModified()) {
-                        returnCache(requestAddr, this.serverResponse);
+                        returnCache(requestAddr, this.clientResponse);
                     } else {
                         // Send client request to remote server
                         forwardRequest(clientReqMSG, serverSocket);
 
+                        // Form server response http message
+                        HTTPMSG serverResponseMSG = formHTTPMSG(serverSocket);
+
                         // Cache and return response
-                        cacheAndReturnResponse(requestAddr, requestHeader, forwardInputStream, this.serverResponse);
+                        cacheAndReturnResponse(requestAddr, serverResponseMSG.getHeader(),
+                                               serverResponseMSG.getBodyScanner(),
+                                               this.clientResponse);
                     }
                 } else {
                     // Send client request to remote server
                     forwardRequest(clientReqMSG, serverSocket);
 
+                    // Get server response stream
+                    BufferedInputStream serverReponse = new BufferedInputStream(serverSocket.getInputStream());
+
                     // Transferring remote server responses back to client
-                    returnResponse(forwardInputStream, this.serverResponse);
+                    returnResponse(serverReponse, this.clientResponse);
                 }
 
-                serverSocket.close();
-                this.socket.close();
+                //serverSocket.close();
+                //this.socket.close();
                 System.out.println("!== End of communication");
 
                 /*
@@ -207,45 +211,48 @@ class ProxyThreadRunnable implements Runnable {
     * Cache response to local file and at the same time return to client
     * */
     private void cacheAndReturnResponse(String reqAddr,
-                                        Header requestHeader,
-                                        BufferedInputStream forwardInputStream,
-                                        BufferedOutputStream serverResponse) throws IOException {
-        if (requestHeader.isTextContent()) {
+                                        Header responseHeader,
+                                        Scanner serverResponseMSG,
+                                        BufferedOutputStream clientResponse) throws IOException {
+        System.out.println("===== Server response header \n" + responseHeader.getHeaderStr());
+
+        if (responseHeader.isTextContent()) {
             // Apply censorship for text content before cache or return
             System.out.println("====== Cache and censor response " + reqAddr);
-            censorCacheAndReturn(reqAddr, forwardInputStream, serverResponse);
+            censorCacheAndReturn(reqAddr, serverResponseMSG, clientResponse);
 
         } else {
             // Cache and return original content for General Media type
             System.out.println("====== Cache original response " + reqAddr);
-            normalCacheAndReturn(reqAddr, forwardInputStream, serverResponse);
+            normalCacheAndReturn(reqAddr, serverResponseMSG, clientResponse);
         }
     }
 
     /*
     * Apply censorship to text messages
     * */
-    private void censorCacheAndReturn(String reqAddr, BufferedInputStream forwardInputStream, BufferedOutputStream serverResponse) throws IOException {
+    private void censorCacheAndReturn(String reqAddr,
+                                      Scanner serverReponse,
+                                      BufferedOutputStream clientResponse) throws IOException {
         File localFile = createCacheFile(reqAddr);
         BufferedOutputStream localFileStream = new BufferedOutputStream(new FileOutputStream(localFile));
 
-        int numResponseBytes;
-        byte[] buffer = new byte[1024];
+        String cur_line = null;
         String cur_censored_read = null;
         byte[] strToByte = null;
 
-        while ((numResponseBytes = forwardInputStream.read(buffer)) != -1) {
-            System.out.println("Receiving and Cache from server " + numResponseBytes + " bytes");
-            cur_censored_read = censorString(new String(buffer, 0, numResponseBytes));
+        while ((cur_line = serverReponse.nextLine()) != null) {
+            System.out.println("Receiving and Cache from server, apply censorship");
+            cur_censored_read = censorString(cur_line);
             strToByte = cur_censored_read.getBytes(Charset.forName("UTF-8"));
 
             localFileStream.write(strToByte, 0, strToByte.length);
-            serverResponse.write(strToByte, 0, strToByte.length);
+            clientResponse.write(strToByte, 0, strToByte.length);
         }
-        serverResponse.flush();
+        clientResponse.flush();
         localFileStream.flush();
 
-        // Close local file
+        // Close local cache file
         localFileStream.close();
     }
 
@@ -263,24 +270,23 @@ class ProxyThreadRunnable implements Runnable {
     * Cache and return original content
     * */
     private void normalCacheAndReturn(String reqAddr,
-                                      BufferedInputStream forwardInputStream,
-                                      BufferedOutputStream serverResponse) throws IOException {
+                                      Scanner serverResponse,
+                                      BufferedOutputStream clientResponse) throws IOException {
 
         File localFile = createCacheFile(reqAddr);
         BufferedOutputStream localFileStream = new BufferedOutputStream(new FileOutputStream(localFile));
 
-        int numResponseBytes;
-        byte[] buffer = new byte[1024];
+        int curByte;
 
-        while ((numResponseBytes = forwardInputStream.read(buffer)) != -1) {
-            System.out.println("Receiving and Cache from server " + numResponseBytes + " bytes");
-            localFileStream.write(buffer, 0, numResponseBytes);
-            serverResponse.write(buffer, 0, numResponseBytes);
+        while (serverResponse.hasNextByte()) {
+            curByte = (int) serverResponse.nextByte();
+            localFileStream.write(curByte);
+            clientResponse.write(curByte);
         }
-        serverResponse.flush();
+        clientResponse.flush();
         localFileStream.flush();
 
-        // Close local file
+        // Close local cache file
         localFileStream.close();
     }
 
@@ -414,7 +420,7 @@ class Header {
         return getField("Content-Type:");
     }
 
-    public Boolean isTextContent() { return this.getContentType() == "text/html";}
+    public Boolean isTextContent() { return this.getContentType().equals("text/html");}
     /*
     * Retrieve a specific field from headerList
     * */
