@@ -219,8 +219,8 @@ class ProxyThreadRunnable implements Runnable {
         if (responseHeader.isTextContent()) {
             // Apply censorship for text content before cache or return
             System.out.println("====== Cache and censor response " + reqAddr);
-            censorCacheAndReturn(reqAddr, serverResponseMSG, clientResponse);
-
+            //censorCacheAndReturn(reqAddr, serverResponseMSG, clientResponse);
+            normalCacheAndReturn(reqAddr, serverResponseMSG, clientResponse);
         } else {
             // Cache and return original content for General Media type
             System.out.println("====== Cache original response " + reqAddr);
@@ -276,10 +276,10 @@ class ProxyThreadRunnable implements Runnable {
         File localFile = createCacheFile(reqAddr);
         BufferedOutputStream localFileStream = new BufferedOutputStream(new FileOutputStream(localFile));
 
-        int curByte;
+        byte curByte;
 
         while (serverResponse.hasNextByte()) {
-            curByte = (int) serverResponse.nextByte();
+            curByte = serverResponse.nextByte();
             localFileStream.write(curByte);
             clientResponse.write(curByte);
         }
