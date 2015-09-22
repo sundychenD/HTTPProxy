@@ -2,6 +2,7 @@ import java.io.*;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.LinkedList;
 import java.util.Scanner;
@@ -74,18 +75,19 @@ class ProxyThreadRunnable implements Runnable {
 
     private Socket socket;
     private HashMap<String, String> cache;
-    private BufferedOutputStream serverResponse;
+    private OutputStream serverResponse;
 
     public ProxyThreadRunnable(Socket socket, HashMap<String, String> cache) throws IOException {
         this.socket = socket;
         this.cache = cache;
-        this.serverResponse = new BufferedOutputStream(socket.getOutputStream());
+        this.serverResponse = socket.getOutputStream();
     }
 
     public void run() {
         String input;
+        boolean continueProcess = true;
         try {
-            while (true) {
+            while (continueProcess) {
 
                 // Receive client request, establish new socket to remote server
                 HTTPMSG clientReqMSG = formHTTPMSG(this.socket);
@@ -94,8 +96,8 @@ class ProxyThreadRunnable implements Runnable {
                 System.out.println("====== Client request: \n" + clientReqMSG.getHeader().getHeaderStr());
 
                 // Connect to remote server
-                Socket serverSocket = new Socket(clientReqMSG.getHeader().getHost(), 80);
-                BufferedInputStream forwardInputStream = new BufferedInputStream(serverSocket.getInputStream());
+                Socket serverSocket = new Socket(clientReqMSG.getHeader().getHost(), clientReqMSG.getHeader().getPort());
+                InputStream forwardInputStream = serverSocket.getInputStream();
 
                 // Check cache for GET requests
                 if (requestHeader.isGet()) {
@@ -122,6 +124,7 @@ class ProxyThreadRunnable implements Runnable {
 
                 serverSocket.close();
                 this.socket.close();
+                continueProcess = false;
                 System.out.println("!== End of communication");
 
                 /*
@@ -156,9 +159,9 @@ class ProxyThreadRunnable implements Runnable {
     /*
     * Read cached file from disc and return to client
     * */
-    private void returnCache(String reqAddr, BufferedOutputStream responseOutput) throws FileNotFoundException {
+    private void returnCache(String reqAddr, OutputStream responseOutput) throws FileNotFoundException {
         String fileAddr = this.cache.get(reqAddr);
-        BufferedInputStream cacheObj = new BufferedInputStream(new FileInputStream(fileAddr));
+        InputStream cacheObj = new FileInputStream(fileAddr);
 
         try {
             int numResponseBytes;
@@ -169,6 +172,7 @@ class ProxyThreadRunnable implements Runnable {
                 responseOutput.write(buffer, 0, numResponseBytes);
             }
             responseOutput.flush();
+            responseOutput.close();
         } catch (IOException e) {
             System.out.println("Cannot read from file");
             e.printStackTrace();
@@ -179,10 +183,10 @@ class ProxyThreadRunnable implements Runnable {
     * Cache response to local file and at the same time return to client
     * */
     private void cacheAndReturnResponse(String reqAddr,
-                                       BufferedInputStream forwardInputStream,
-                                       BufferedOutputStream serverResponse) throws IOException {
+                                       InputStream forwardInputStream,
+                                       OutputStream serverResponse) throws IOException {
         File localFile = createCacheFile(reqAddr);
-        BufferedOutputStream localFileStream = new BufferedOutputStream(new FileOutputStream(localFile));
+        OutputStream localFileStream = new FileOutputStream(localFile);
 
         int numResponseBytes;
         byte[] buffer = new byte[1024];
@@ -197,6 +201,7 @@ class ProxyThreadRunnable implements Runnable {
 
         // Close local file
         localFileStream.close();
+        serverResponse.close();
     }
 
     /*
@@ -223,25 +228,25 @@ class ProxyThreadRunnable implements Runnable {
     }
 
     /*
-    *
-    * */
-
-    /*
     * Forward clinet request to remote server;
     * */
     private void forwardRequest(HTTPMSG clientReqMSG, Socket serverSocket) throws IOException {
         Header clientReqHeader = clientReqMSG.getHeader();
-        Scanner bodyScanner = clientReqMSG.getBodyScanner();
-        BufferedOutputStream serverOutput = new BufferedOutputStream(serverSocket.getOutputStream());
+        InputStreamReader clientInputReader = clientReqMSG.getbodyReader();
+        OutputStream serverOutput = serverSocket.getOutputStream();
 
         // Send header in byte array
         byte[] headerByteArray = clientReqHeader.getHeaderByte();
         serverOutput.write(headerByteArray, 0, headerByteArray.length);
 
         // Send message body if request is POST type
+
+        String postBody;
         if (clientReqHeader.isPost()) {
-            while (bodyScanner.hasNextByte()) {
-                serverOutput.write((int) bodyScanner.nextByte());
+            System.out.println("===== Encounter Post Request");
+            while (!(postBody = this.readLine(clientInputReader)).trim().isEmpty()) {
+                System.out.println("===== Send Post Request:\n " + postBody);
+                serverOutput.write(postBody.getBytes());
             }
         }
         serverOutput.flush();
@@ -251,22 +256,53 @@ class ProxyThreadRunnable implements Runnable {
     * Form a HTTPMSG class
     * */
     private HTTPMSG formHTTPMSG(Socket socket) throws IOException {
-        BufferedInputStream buf_input = new BufferedInputStream(socket.getInputStream());
-        Scanner sc = new Scanner(buf_input);
-        Header clientRequestHeader = new Header(readHeader(sc));
-        return new HTTPMSG(clientRequestHeader, sc);
+        InputStream buf_input = socket.getInputStream();
+        InputStreamReader inputReader = new InputStreamReader(buf_input, StandardCharsets.US_ASCII);
+        Header clientRequestHeader = new Header(readHeader(inputReader));
+        return new HTTPMSG(clientRequestHeader, inputReader);
+    }
+
+    /*
+    * Read buffered input stream in lines
+    * */
+    private String readLine(InputStreamReader r) throws IOException {
+        // HTTP carries both textual and binary elements.
+        // Not using BufferedReader.readLine() so it does
+        // not "steal" bytes from BufferedInputStream...
+
+        // HTTP itself only allows 7bit ASCII characters
+        // in headers, but some header values may be
+        // further encoded using RFC 2231 or 5987 to
+        // carry Unicode characters ...
+
+        String[] result = new String[2];
+        StringBuilder sb = new StringBuilder();
+
+        result[1] = "continue";
+        char[] c = new char[1];
+        while (r.ready() && r.read(c) >= 0) {
+            if (c[0] == '\n') break;
+            if (c[0] == '\r') {
+                r.read(c);
+                if ((c[0] < 0) || (c[0] == '\n')) break;
+                sb.append('\r');
+            }
+            sb.append(c);
+        }
+        sb.append('\n');
+        return sb.toString();
     }
 
     /*
     * Read http header into String
     * */
-    private String readHeader(Scanner input) {
+    private String readHeader(InputStreamReader input) throws IOException {
         String header = "";
         String next;
-        while(!(next = input.nextLine()).trim().equals("")) {
-            header += next + "\n";
+        while(!(next = this.readLine(input)).trim().isEmpty()) {
+            header += next;
         }
-        header += "\n";
+        header += "\r\n";
 
         return header;
     }
@@ -274,15 +310,20 @@ class ProxyThreadRunnable implements Runnable {
     /*
     * Return the remote server response to the client
     * */
-    private void returnResponse(BufferedInputStream serverResponse, BufferedOutputStream clientOutput) throws IOException {
+    private void returnResponse(InputStream serverResponse, OutputStream clientOutput) throws IOException {
         int numResponseBytes;
         byte[] buffer = new byte[1024];
 
-        while ((numResponseBytes = serverResponse.read(buffer)) != -1) {
-            System.out.println("Receiving from server" + numResponseBytes + " bytes");
+        while (((numResponseBytes = serverResponse.read(buffer)) != -1)) {
+            System.out.println("Receiving from server " + numResponseBytes + " bytes");
             clientOutput.write(buffer, 0, numResponseBytes);
+
+            if ((serverResponse.available() == 0)) {
+                break;
+            }
         }
         clientOutput.flush();
+        clientOutput.close();
     }
 }
 
@@ -304,7 +345,7 @@ class Header {
 
     /* Header in byte array */
     public byte[] getHeaderByte() {
-        return this.rawHeader.getBytes(Charset.forName("UTF-8"));
+        return this.rawHeader.getBytes(StandardCharsets.US_ASCII);
     }
 
     public boolean isGet() {
@@ -320,10 +361,33 @@ class Header {
     }
 
     public String getHost() {
-        return getField("Host:");
+        String hostField = getField("Host:");
+        if (hostField.contains(":")) {
+            return hostField.split(":")[0];
+        } else {
+            return hostField;
+        }
     }
 
-    public String getRequest() { return this.headerList.getFirst().split(" ")[1]; }
+    public int getPort() {
+        String hostField = getField("Host:");
+        if (hostField.contains(":")) {
+            return Integer.parseInt(hostField.split(":")[1]);
+        } else {
+            return 80;
+        }
+    }
+
+    public String getRequest() {
+        try {
+            return this.headerList.getFirst().split(" ")[1];
+        }catch (IndexOutOfBoundsException e) {
+            System.out.println(e.getMessage());
+            System.out.println("===== Index out of bound, raw header is: <" + this.headerList.getFirst()+ " >");
+            e.printStackTrace();
+            return "LOCALHOST";
+        }
+    }
 
     public String getContentType() {
         return getField("Content-Type:");
@@ -368,18 +432,18 @@ class Header {
 class HTTPMSG {
 
     private Header header;
-    private Scanner bodyScanner;
+    private InputStreamReader bodyReader;
 
-    public HTTPMSG(Header header, Scanner sc) {
+    public HTTPMSG(Header header, InputStreamReader inputReader) {
         this.header = header;
-        this.bodyScanner = sc;
+        this.bodyReader = inputReader;
     }
 
     public Header getHeader() {
         return this.header;
     }
 
-    public Scanner getBodyScanner() {
-        return this.bodyScanner;
+    public InputStreamReader getbodyReader() {
+        return this.bodyReader;
     }
 }
