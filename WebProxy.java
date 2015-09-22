@@ -39,6 +39,8 @@ class ProxyServer {
 
     public HashMap <String, String> cache;
 
+    public HashMap <String, String> cacheModifiedTime;
+
     public ProxyServer(int port) {
         this.listeningPort = port;
     }
@@ -47,13 +49,14 @@ class ProxyServer {
 
         try {
             this.cache = new HashMap<String, String>();
+            this.cacheModifiedTime = new HashMap<String, String>();
             ServerSocket serverSocket = new ServerSocket(this.listeningPort);
             Socket clientSocket;
 
             // Loop for creating new handling thread
             while (true) {
                 clientSocket = serverSocket.accept();
-                Runnable echoRunnable = new ProxyThreadRunnable(clientSocket, this.cache);
+                Runnable echoRunnable = new ProxyThreadRunnable(clientSocket, this.cache, this.cacheModifiedTime);
                 Thread echoThread = new Thread(echoRunnable);
                 echoThread.start();
             }
@@ -74,13 +77,15 @@ class ProxyThreadRunnable implements Runnable {
 
     private Socket socket;
     private HashMap<String, String> cache;
+    private HashMap<String, String> cacheModifiedTime;
     private BufferedOutputStream clientResponse;
     private File cacheDir;
     private String[] censorWords;
 
-    public ProxyThreadRunnable(Socket socket, HashMap<String, String> cache) throws IOException {
+    public ProxyThreadRunnable(Socket socket, HashMap<String, String> cache, HashMap<String, String> cacheModifiedTime) throws IOException {
         this.socket = socket;
         this.cache = cache;
+        this.cacheModifiedTime = cacheModifiedTime;
         this.clientResponse = new BufferedOutputStream(socket.getOutputStream());
         this.cacheDir = new File("ProxyCachedFile");
         this.censorWords = readFromCensorFile();
@@ -104,8 +109,9 @@ class ProxyThreadRunnable implements Runnable {
 
                 // Check cache for GET requests
                 if (requestHeader.isGet()) {
-                    if (isCached(requestAddr) && notModified()) {
+                    if (isCached(requestAddr) && notModified(requestHeader, getCacheLastModifiedTime(requestAddr), serverSocket)) {
                         returnCache(requestAddr, this.clientResponse);
+                        //this.clientResponse.close();
                     } else {
                         // Send client request to remote server
                         forwardRequest(clientReqMSG, serverSocket);
@@ -114,9 +120,7 @@ class ProxyThreadRunnable implements Runnable {
                         HTTPMSG serverResponseMSG = formHTTPMSG(serverSocket);
 
                         // Cache and return response
-                        cacheAndReturnResponse(requestAddr, serverResponseMSG.getHeader(),
-                                               serverResponseMSG.getBodyScanner(),
-                                               this.clientResponse);
+                        cacheAndReturnResponse(requestAddr, serverResponseMSG, this.clientResponse);
                     }
                 } else {
                     // Send client request to remote server
@@ -129,25 +133,10 @@ class ProxyThreadRunnable implements Runnable {
                     returnResponse(serverReponse, this.clientResponse);
                 }
 
-                //serverSocket.close();
-                //this.socket.close();
+                this.clientResponse.close();
+                serverSocket.close();
+                this.socket.close();
                 System.out.println("!== End of communication");
-
-                /*
-                if (cached(clientRequest)) {
-                    if (modified(clientRequest)) {
-                        // Original page updated, retrieve new page
-                        cacheResponse();    
-                        forwardResponse();
-                    } else {
-                        // Original page not updated, return local cached response
-                        forwardResponse();
-                    }
-                } else {
-                    cacheResponse();
-                    forwardReponse();
-                }
-                */
             }
         } catch (IOException e) {
             System.out.println(e.getMessage());
@@ -155,8 +144,46 @@ class ProxyThreadRunnable implements Runnable {
         }
     }
 
-    private boolean notModified() {
-        return true;
+    /*
+    * Retrieve last modified time of the cached file
+    * */
+    private String getCacheLastModifiedTime(String requestAddress) {
+        return this.cacheModifiedTime.get(requestAddress);
+    }
+
+    /*
+    * Send if modified message to server to judge if cached content is modified or not
+    * */
+    private boolean notModified(Header requestHeader, String lastModifiedTime, Socket serverSocket) throws IOException{
+        String ifModifiedMSG = formIfModifiedMSG(requestHeader, lastModifiedTime);
+        PrintWriter serverWriter = new PrintWriter(serverSocket.getOutputStream(), true);
+
+        serverWriter.println(ifModifiedMSG);
+        serverWriter.flush();
+        //serverWriter.close();
+        System.out.println("===== If modified header \n");
+        System.out.println(ifModifiedMSG);
+
+        BufferedReader serverResponse = new BufferedReader(new InputStreamReader(serverSocket.getInputStream()));
+        String serverResponseHeader;
+        System.out.println("===== Server if modified response\n");
+        while (!(serverResponseHeader = serverResponse.readLine()).trim().isEmpty()) {
+            System.out.println(serverResponseHeader);
+            if (serverResponseHeader.contains("304") && serverResponseHeader.contains("Not Modified")) {
+                System.out.println("===== Cache not modified");
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /*
+    * Return a simple HTTP header contains if modified field
+    * */
+    private String formIfModifiedMSG(Header requestHeader, String lastModifiedTime) {
+        String trimedHeaderStr = requestHeader.getHeaderStr().trim();
+        String lastModifiedField = "If-Modified-Since: ".concat(lastModifiedTime);
+        return trimedHeaderStr.concat("\n").concat(lastModifiedField).concat("\r\n\r\n");
     }
 
     /*
@@ -187,7 +214,7 @@ class ProxyThreadRunnable implements Runnable {
     * Read cached file from disc and return to client
     * */
     private void returnCache(String reqAddr, BufferedOutputStream responseOutput) throws FileNotFoundException {
-        System.out.println("====== Hit cache " + reqAddr);
+        System.out.println("====== Hit cache and cache not modified " + reqAddr);
 
         String fileAddr = this.cache.get(reqAddr);
         BufferedInputStream cacheObj = new BufferedInputStream(new FileInputStream(fileAddr));
@@ -211,20 +238,20 @@ class ProxyThreadRunnable implements Runnable {
     * Cache response to local file and at the same time return to client
     * */
     private void cacheAndReturnResponse(String reqAddr,
-                                        Header responseHeader,
-                                        Scanner serverResponseMSG,
+                                        HTTPMSG serverResponseMSG,
                                         BufferedOutputStream clientResponse) throws IOException {
+        Header responseHeader = serverResponseMSG.getHeader();
         System.out.println("===== Server response header \n" + responseHeader.getHeaderStr());
 
         if (responseHeader.isTextContent()) {
             // Apply censorship for text content before cache or return
             System.out.println("====== Cache and censor response " + reqAddr);
             //censorCacheAndReturn(reqAddr, serverResponseMSG, clientResponse);
-            normalCacheAndReturn(reqAddr, serverResponseMSG, clientResponse);
+            //normalCacheAndReturn(reqAddr, responseHeader.getLastModifiedTime(), serverResponseMSG.getInputStream(), clientResponse);
         } else {
             // Cache and return original content for General Media type
             System.out.println("====== Cache original response " + reqAddr);
-            normalCacheAndReturn(reqAddr, serverResponseMSG, clientResponse);
+            normalCacheAndReturn(reqAddr, responseHeader.getLastModifiedTime(), serverResponseMSG.getInputStream(), clientResponse);
         }
     }
 
@@ -232,9 +259,10 @@ class ProxyThreadRunnable implements Runnable {
     * Apply censorship to text messages
     * */
     private void censorCacheAndReturn(String reqAddr,
+                                      String lastModifiedTime,
                                       Scanner serverReponse,
                                       BufferedOutputStream clientResponse) throws IOException {
-        File localFile = createCacheFile(reqAddr);
+        File localFile = createCacheFile(reqAddr, lastModifiedTime);
         BufferedOutputStream localFileStream = new BufferedOutputStream(new FileOutputStream(localFile));
 
         String cur_line = null;
@@ -270,34 +298,38 @@ class ProxyThreadRunnable implements Runnable {
     * Cache and return original content
     * */
     private void normalCacheAndReturn(String reqAddr,
-                                      Scanner serverResponse,
+                                      String lastModifiedTime,
+                                      DataInputStream serverResponse,
                                       BufferedOutputStream clientResponse) throws IOException {
 
-        File localFile = createCacheFile(reqAddr);
+        //lastModifiedTime = "Fri, 09 Jan 2015 11:27:40 GMT";
+        File localFile = createCacheFile(reqAddr, lastModifiedTime);
         BufferedOutputStream localFileStream = new BufferedOutputStream(new FileOutputStream(localFile));
 
-        byte curByte;
+        int numResponseBytes;
+        byte[] buffer = new byte[1024];
 
-        while (serverResponse.hasNextByte()) {
-            curByte = serverResponse.nextByte();
-            localFileStream.write(curByte);
-            clientResponse.write(curByte);
+        while ((numResponseBytes = serverResponse.read(buffer)) != -1) {
+            localFileStream.write(buffer, 0, numResponseBytes);
+            clientResponse.write(buffer, 0, numResponseBytes);
         }
         clientResponse.flush();
         localFileStream.flush();
 
         // Close local cache file
         localFileStream.close();
+        //clientResponse.close();
     }
 
     /*
     * Create local file and add to cache list
     * Put filePath into cache hashmap and create new file
     * */
-    private File createCacheFile(String cacheRequAddr) throws IOException {
+    private File createCacheFile(String cacheRequAddr, String lastModifiedTime) throws IOException {
 
         String cacheFileAddr = "ProxyCachedFile/" + cacheRequAddr.hashCode();
         this.cache.put(cacheRequAddr, cacheFileAddr);
+        this.cacheModifiedTime.put(cacheRequAddr, lastModifiedTime);
 
         System.out.println("====== Create Cache File Address at: " + cacheFileAddr);
         File cacheFile = new File(cacheFileAddr);
@@ -322,42 +354,43 @@ class ProxyThreadRunnable implements Runnable {
         System.out.println("====== Forwarding request to server");
 
         Header clientReqHeader = clientReqMSG.getHeader();
-        Scanner bodyScanner = clientReqMSG.getBodyScanner();
-        BufferedOutputStream serverOutput = new BufferedOutputStream(serverSocket.getOutputStream());
+        DataInputStream contentReader = clientReqMSG.getInputStream();
+        BufferedWriter serverOutputWriter = new BufferedWriter(new PrintWriter(serverSocket.getOutputStream(), true));
 
         // Send header in byte array
-        byte[] headerByteArray = clientReqHeader.getHeaderByte();
-        serverOutput.write(headerByteArray, 0, headerByteArray.length);
+        String headerString = clientReqHeader.getHeaderStr();
+        serverOutputWriter.write(headerString);
 
         // Send message body if request is POST type
+        String userInput;
         if (clientReqHeader.isPost()) {
-            while (bodyScanner.hasNextByte()) {
-                serverOutput.write((int) bodyScanner.nextByte());
+            while ((userInput = contentReader.readLine()) != null) {
+                serverOutputWriter.write(userInput);
             }
         }
-        serverOutput.flush();
+        serverOutputWriter.flush();
+        //serverOutputWriter.close();
     }
 
     /*
     * Form a HTTPMSG class
     * */
     private HTTPMSG formHTTPMSG(Socket socket) throws IOException {
-        BufferedInputStream buf_input = new BufferedInputStream(socket.getInputStream());
-        Scanner sc = new Scanner(buf_input);
-        Header clientRequestHeader = new Header(readHeader(sc));
-        return new HTTPMSG(clientRequestHeader, sc);
+        DataInputStream buf_input = new DataInputStream(socket.getInputStream());
+        Header clientRequestHeader = new Header(readHeader(buf_input));
+        return new HTTPMSG(clientRequestHeader, buf_input);
     }
 
     /*
     * Read http header into String
     * */
-    private String readHeader(Scanner input) {
+    private String readHeader(DataInputStream input) throws IOException, NullPointerException {
         String header = "";
         String next;
-        while(!(next = input.nextLine()).trim().equals("")) {
+        while(!(next = input.readLine()).trim().isEmpty()) {
             header += next + "\n";
         }
-        header += "\n";
+        header += "\r\n\r\n";
 
         return header;
     }
@@ -420,7 +453,10 @@ class Header {
         return getField("Content-Type:");
     }
 
+    public String getLastModifiedTime() { return getField("Last-Modified:"); }
+
     public Boolean isTextContent() { return this.getContentType().equals("text/html");}
+
     /*
     * Retrieve a specific field from headerList
     * */
@@ -431,7 +467,7 @@ class Header {
         for (int i = 0; i < this.headerList.size(); i++) {
             cur_field = this.headerList.get(i);
             if (cur_field.toUpperCase().startsWith(fieldName.toUpperCase())) {
-                field = (cur_field.split(":")[1]).trim();
+                field = (cur_field.split(": ")[1]).trim();
             }
         }
         return field;
@@ -460,18 +496,18 @@ class Header {
 class HTTPMSG {
 
     private Header header;
-    private Scanner bodyScanner;
+    private DataInputStream inputStream;
 
-    public HTTPMSG(Header header, Scanner sc) {
+    public HTTPMSG(Header header, DataInputStream inputReader) {
         this.header = header;
-        this.bodyScanner = sc;
+        this.inputStream = inputReader;
     }
 
     public Header getHeader() {
         return this.header;
     }
 
-    public Scanner getBodyScanner() {
-        return this.bodyScanner;
+    public DataInputStream getInputStream() {
+        return this.inputStream;
     }
 }
