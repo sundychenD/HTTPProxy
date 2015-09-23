@@ -1,11 +1,10 @@
 import java.io.*;
 import java.net.ServerSocket;
 import java.net.Socket;
-import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.LinkedList;
-import java.util.Scanner;
 
 /**
  * Created by chendi on 3/9/15.
@@ -89,6 +88,100 @@ class ProxyThreadRunnable implements Runnable {
         try {
             while (continueProcess) {
 
+                // Client Stream
+                InputStream clientRequestStream = this.socket.getInputStream();
+                OutputStream clientOutputStream = this.serverResponse;
+                // Server Stream
+                Socket serverSocket = null;
+                OutputStream serverOutputStream = null;
+                InputStream serverInputStream = null;
+
+
+
+                // ========== Forward Client Request To Server
+                int numBytesRead = 0;
+                int totalContentBytesRead = 0;
+                int contentLength = 0;
+                int headerEnd = 0;
+                byte[] buffer = new byte[8190];
+                Header clientRequestHeader;
+
+                boolean hasNotReadHeader = true;
+                boolean continueReadFromClient = true;
+                while (continueReadFromClient) {
+
+                    numBytesRead = clientRequestStream.read(buffer);
+                    totalContentBytesRead += numBytesRead;
+
+                    if (numBytesRead == 0) {
+                        break;
+                    }
+
+                    if (hasNotReadHeader) {
+                        headerEnd = getHeaderEnd(buffer);
+                        clientRequestHeader = new Header(getHeader(buffer, headerEnd));
+                        contentLength = clientRequestHeader.getContentLength();
+                        totalContentBytesRead = numBytesRead - headerEnd;
+
+                        // Establish Socket Connection with remote Server
+                        serverSocket = new Socket(clientRequestHeader.getHost(), clientRequestHeader.getPort());
+                        serverOutputStream = serverSocket.getOutputStream();
+                        serverInputStream = serverSocket.getInputStream();
+
+                        hasNotReadHeader = false;
+                    }
+
+                    if (totalContentBytesRead > contentLength) {
+                        continueReadFromClient = false;
+                    } else {
+                        continueReadFromClient = true;
+                    }
+
+                    // Forward Request to remote Server
+                    serverOutputStream.write(buffer, 0, numBytesRead);
+                    serverOutputStream.flush();
+                }
+
+
+
+
+
+                // ========== Return Server Response to Client
+                int numBytesRead_Server = 0;
+                int totalContentBytesRead_Server = 0;
+                int contentLength_Server = 0;
+                int headerEnd_Server = 0;
+                byte[] buffer_Server = new byte[49152];
+                Header serverResponseHeader;
+
+                boolean hasNotReadHeader_Server = true;
+                boolean continueReadFromServer = true;
+                while (continueReadFromServer) {
+                    numBytesRead_Server = serverInputStream.read(buffer_Server);
+                    totalContentBytesRead_Server += numBytesRead_Server;
+
+                    if (hasNotReadHeader_Server) {
+                        headerEnd_Server = getHeaderEnd(buffer_Server);
+                        serverResponseHeader = new Header(getHeader(buffer_Server, headerEnd_Server));
+                        contentLength_Server = serverResponseHeader.getContentLength();
+                        totalContentBytesRead_Server = numBytesRead_Server - headerEnd_Server;
+
+                        hasNotReadHeader_Server = false;
+                    }
+
+                    if (totalContentBytesRead_Server > contentLength_Server) {
+                        continueReadFromServer = false;
+                    } else {
+                        continueReadFromServer = true;
+                    }
+
+                    // Forward Request to remote Server
+                    clientOutputStream.write(buffer_Server, 0, numBytesRead_Server);
+                    clientOutputStream.flush();
+                }
+
+                /*
+
                 // Receive client request, establish new socket to remote server
                 HTTPMSG clientReqMSG = formHTTPMSG(this.socket);
                 Header requestHeader = clientReqMSG.getHeader();
@@ -97,7 +190,7 @@ class ProxyThreadRunnable implements Runnable {
 
                 // Connect to remote server
                 Socket serverSocket = new Socket(clientReqMSG.getHeader().getHost(), clientReqMSG.getHeader().getPort());
-                InputStream forwardInputStream = serverSocket.getInputStream();
+                InputStream serverInputStream = serverSocket.getInputStream();
 
                 // Check cache for GET requests
                 if (requestHeader.isGet()) {
@@ -111,7 +204,7 @@ class ProxyThreadRunnable implements Runnable {
 
                         // Cache and return response
                         System.out.println("====== Cache response " + requestAddr);
-                        cacheAndReturnResponse(requestAddr, forwardInputStream, this.serverResponse);
+                        cacheAndReturnResponse(requestAddr, serverInputStream, this.serverResponse);
                     }
                 } else {
                     // Send client request to remote server
@@ -119,8 +212,9 @@ class ProxyThreadRunnable implements Runnable {
                     forwardRequest(clientReqMSG, serverSocket);
 
                     // Transferring remote server responses back to client
-                    returnResponse(forwardInputStream, this.serverResponse);
+                    returnResponse(serverInputStream, this.serverResponse);
                 }
+                */
 
                 serverSocket.close();
                 this.socket.close();
@@ -147,6 +241,25 @@ class ProxyThreadRunnable implements Runnable {
             System.out.println(e.getMessage());
             e.printStackTrace();
         }
+    }
+
+    private int getHeaderEnd(byte[] buffer) {
+        for (int i = 0; i < buffer.length; i++) {
+            if (i <= buffer.length - 4) {
+                if (buffer[i] == 13 && buffer[i + 1] == 10 && buffer[i + 2] == 13 && buffer[i + 3] == 10) {
+                    return i + 3;
+                }
+            }
+        }
+        System.out.println("===== Cannot read header end, header too long");
+        String header = new String(buffer);
+        System.out.println("===== Header Received: \n" + header);
+        return buffer.length - 1;
+    }
+
+    private String getHeader(byte[] buffer, int headerEnd) {
+        byte[] headerByteArray = Arrays.copyOfRange(buffer, 0, headerEnd);
+        return new String(headerByteArray);
     }
 
     /*
@@ -391,6 +504,15 @@ class Header {
 
     public String getContentType() {
         return getField("Content-Type:");
+    }
+
+    public int getContentLength() {
+        for (int i = 0; i < this.headerList.size(); i++) {
+            if (this.headerList.get(i).contains("Content-Length:")) {
+                return Integer.parseInt(getField("Content-Length:"));
+            }
+        }
+        return 0;
     }
 
     /*
