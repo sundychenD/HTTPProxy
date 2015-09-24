@@ -1,7 +1,6 @@
 import java.io.*;
 import java.net.ServerSocket;
 import java.net.Socket;
-import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.LinkedList;
@@ -38,6 +37,7 @@ class ProxyServer {
     private int listeningPort;
 
     public HashMap <String, String> cache;
+    private HashMap<String, String> cacheModifedTime;
 
     public ProxyServer(int port) {
         this.listeningPort = port;
@@ -47,13 +47,14 @@ class ProxyServer {
 
         try {
             this.cache = new HashMap<String, String>();
+            this.cacheModifedTime = new HashMap<String, String>();
             ServerSocket serverSocket = new ServerSocket(this.listeningPort);
             Socket clientSocket;
 
             // Loop for creating new handling thread
             while (true) {
                 clientSocket = serverSocket.accept();
-                Runnable echoRunnable = new ProxyThreadRunnable(clientSocket, this.cache);
+                Runnable echoRunnable = new ProxyThreadRunnable(clientSocket, this.cache, this.cacheModifedTime);
                 Thread echoThread = new Thread(echoRunnable);
                 echoThread.start();
             }
@@ -74,12 +75,18 @@ class ProxyThreadRunnable implements Runnable {
 
     private Socket socket;
     private HashMap<String, String> cache;
+    private HashMap<String, String> cacheModifiedTime;
     private OutputStream serverResponse;
+    private File cacheDir;
 
-    public ProxyThreadRunnable(Socket socket, HashMap<String, String> cache) throws IOException {
+    public ProxyThreadRunnable(Socket socket, HashMap<String, String> cache, HashMap<String, String> cacheModifiedTime) throws IOException {
         this.socket = socket;
         this.cache = cache;
+        this.cacheModifiedTime = cacheModifiedTime;
+        this.cacheDir = new File("ProxyCachedFile");
         this.serverResponse = socket.getOutputStream();
+
+        createCacheDir();
     }
 
     public void run() {
@@ -104,18 +111,22 @@ class ProxyThreadRunnable implements Runnable {
                 int contentLength = 0;
                 int headerEnd = 0;
                 byte[] buffer = new byte[8190];
-                Header clientRequestHeader;
+                Header clientRequestHeader = null;
 
                 boolean hasNotReadHeader = true;
                 boolean continueReadFromClient = true;
+
+                boolean continueReadFromServer = true;
+
                 while (continueReadFromClient) {
-
                     numBytesRead = clientRequestStream.read(buffer);
-                    totalContentBytesRead += numBytesRead;
 
-                    if (numBytesRead == 0) {
+                    if (numBytesRead == -1) {
+                        continueReadFromServer = false;
                         break;
                     }
+
+                    totalContentBytesRead += numBytesRead;
 
                     if (hasNotReadHeader) {
                         headerEnd = getHeaderEnd(buffer);
@@ -124,9 +135,21 @@ class ProxyThreadRunnable implements Runnable {
                         totalContentBytesRead = numBytesRead - headerEnd;
 
                         // Establish Socket Connection with remote Server
+                        //serverSocket = new Socket("www.example.com", 443);
                         serverSocket = new Socket(clientRequestHeader.getHost(), clientRequestHeader.getPort());
                         serverOutputStream = serverSocket.getOutputStream();
                         serverInputStream = serverSocket.getInputStream();
+
+                        // Return Local Cached File
+                        String requestAddr = clientRequestHeader.getRequest();
+                        if (clientRequestHeader.isGet() && isCached(requestAddr)) {
+                            if (this.cacheModifiedTime.get(requestAddr) != null
+                                    && notModified(clientRequestHeader, serverOutputStream, serverInputStream)) {
+                                returnCache(clientRequestHeader.getRequest(), clientOutputStream);
+                                continueReadFromServer = false;
+                                break;
+                            }
+                        }
 
                         hasNotReadHeader = false;
                     }
@@ -140,6 +163,8 @@ class ProxyThreadRunnable implements Runnable {
                     // Forward Request to remote Server
                     serverOutputStream.write(buffer, 0, numBytesRead);
                     serverOutputStream.flush();
+
+                    System.out.println("===== Client Request to address: " + clientRequestHeader.getHeaderStr());
                 }
 
 
@@ -151,11 +176,16 @@ class ProxyThreadRunnable implements Runnable {
                 int totalContentBytesRead_Server = 0;
                 int contentLength_Server = 0;
                 int headerEnd_Server = 0;
-                byte[] buffer_Server = new byte[49152];
-                Header serverResponseHeader;
+                byte[] buffer_Server = new byte[8190];
+                Header serverResponseHeader = null;
 
                 boolean hasNotReadHeader_Server = true;
-                boolean continueReadFromServer = true;
+                boolean hasCreateLocalFile = false;
+
+                // Local file output
+                OutputStream localFileStream = null;
+                File localFile;
+
                 while (continueReadFromServer) {
                     numBytesRead_Server = serverInputStream.read(buffer_Server);
                     totalContentBytesRead_Server += numBytesRead_Server;
@@ -169,80 +199,129 @@ class ProxyThreadRunnable implements Runnable {
                         hasNotReadHeader_Server = false;
                     }
 
-                    if (totalContentBytesRead_Server > contentLength_Server) {
-                        continueReadFromServer = false;
-                    } else {
-                        continueReadFromServer = true;
+                    int attempts = 0;
+                    while (serverInputStream.available() == 0 && attempts < 5)
+                    {
+                        attempts++;
+                        Thread.sleep(10);
                     }
 
-                    // Forward Request to remote Server
-                    clientOutputStream.write(buffer_Server, 0, numBytesRead_Server);
-                    clientOutputStream.flush();
-                }
+                    if (serverInputStream.available() != 0) {
+                        // Return response to client
+                        //lastModifiedTime = "Fri, 09 Jan 2015 11:27:40 GMT";
+                        if (!hasCreateLocalFile) {
+                            localFile = createCacheFile(clientRequestHeader.getRequest(), serverResponseHeader.getLastModifiedTime());
+                            localFileStream = new FileOutputStream(localFile);
 
-                /*
+                            hasCreateLocalFile = true;
+                        }
 
-                // Receive client request, establish new socket to remote server
-                HTTPMSG clientReqMSG = formHTTPMSG(this.socket);
-                Header requestHeader = clientReqMSG.getHeader();
-                String requestAddr = requestHeader.getRequest();
-                System.out.println("====== Client request: \n" + clientReqMSG.getHeader().getHeaderStr());
+                        localFileStream.write(buffer_Server, 0, numBytesRead_Server);
+                        clientOutputStream.write(buffer_Server, 0, numBytesRead_Server);
 
-                // Connect to remote server
-                Socket serverSocket = new Socket(clientReqMSG.getHeader().getHost(), clientReqMSG.getHeader().getPort());
-                InputStream serverInputStream = serverSocket.getInputStream();
+                        localFileStream.flush();
+                        clientOutputStream.flush();
 
-                // Check cache for GET requests
-                if (requestHeader.isGet()) {
-                    if (isCached(requestAddr)) {
-                        System.out.println("====== Hit cache " + requestAddr);
-                        returnCache(requestAddr, this.serverResponse);
+                        System.out.println("===== Server Response header: " + serverResponseHeader.getHeaderStr());
+
+                        continue;
                     } else {
-                        // Send client request to remote server
-                        System.out.println("====== Forwarding request to server");
-                        forwardRequest(clientReqMSG, serverSocket);
 
-                        // Cache and return response
-                        System.out.println("====== Cache response " + requestAddr);
-                        cacheAndReturnResponse(requestAddr, serverInputStream, this.serverResponse);
+                        if (!hasCreateLocalFile) {
+                            localFile = createCacheFile(clientRequestHeader.getRequest(), serverResponseHeader.getLastModifiedTime());
+                            localFileStream = new FileOutputStream(localFile);
+
+                            hasCreateLocalFile = true;
+                        }
+
+                        localFileStream.write(buffer_Server, 0, numBytesRead_Server);
+                        clientOutputStream.write(buffer_Server, 0, numBytesRead_Server);
+
+                        localFileStream.flush();
+                        clientOutputStream.flush();
+
+                        if (totalContentBytesRead_Server > contentLength_Server) {
+                            continueReadFromServer = false;
+                        } else {
+                            continueReadFromServer = true;
+                        }
+
+                        System.out.println("===== Server Response header: " + serverResponseHeader.getHeaderStr());
                     }
-                } else {
-                    // Send client request to remote server
-                    System.out.println("====== Forwarding request to server");
-                    forwardRequest(clientReqMSG, serverSocket);
-
-                    // Transferring remote server responses back to client
-                    returnResponse(serverInputStream, this.serverResponse);
                 }
-                */
 
-                serverSocket.close();
+                if (serverSocket != null) {
+                    serverSocket.close();
+                }
+                if (localFileStream != null) {
+                    localFileStream.close();
+                }
                 this.socket.close();
                 continueProcess = false;
                 System.out.println("!== End of communication");
-
-                /*
-                if (cached(clientRequest)) {
-                    if (modified(clientRequest)) {
-                        // Original page updated, retrieve new page
-                        cacheResponse();    
-                        forwardResponse();
-                    } else {
-                        // Original page not updated, return local cached response
-                        forwardResponse();
-                    }
-                } else {
-                    cacheResponse();
-                    forwardReponse();
-                }
-                */
             }
         } catch (IOException e) {
             System.out.println(e.getMessage());
             e.printStackTrace();
+        } catch (InterruptedException e) {
+            e.printStackTrace();
         }
     }
 
+    /*
+    * Send to server if modified
+    * */
+    private boolean notModified(Header requestHeader, OutputStream serverOutputStream, InputStream serverInputStream) throws IOException{
+        String lastModifiedTime = getCacheLastModifiedTime(requestHeader.getRequest());
+        String ifModifiedMSG = formIfModifiedMSG(requestHeader, lastModifiedTime);
+
+        // Send not Modified MSG to server
+        byte[] modifiedMSGByteArray = ifModifiedMSG.getBytes();
+        serverOutputStream.write(modifiedMSGByteArray, 0, modifiedMSGByteArray.length);
+        serverOutputStream.flush();
+        System.out.println("===== If modified header \n");
+        System.out.println(ifModifiedMSG);
+
+
+        // Read Server Response
+        byte[] buffer_Server = new byte[8190];
+        int headerEnd_Server;
+        Header serverResponseHeader;
+        String responseHeaderStr;
+
+        serverInputStream.read(buffer_Server);
+        headerEnd_Server = getHeaderEnd(buffer_Server);
+        serverResponseHeader = new Header(getHeader(buffer_Server, headerEnd_Server));
+        responseHeaderStr = serverResponseHeader.getHeaderStr();
+
+        if (responseHeaderStr.contains("304") && responseHeaderStr.contains("Not Modified")) {
+            System.out.println("===== Cache not modified");
+            System.out.println("===== Server not modified response header \n");
+            System.out.println(responseHeaderStr);
+            return true;
+        }
+        return false;
+    }
+
+    /*
+    * Return a simple HTTP header contains if modified field
+    * */
+    private String formIfModifiedMSG(Header requestHeader, String lastModifiedTime) {
+        String trimedHeaderStr = requestHeader.getHeaderStr().trim();
+        String lastModifiedField = "If-Modified-Since: ".concat(lastModifiedTime);
+        return trimedHeaderStr.concat("\r\n").concat(lastModifiedField).concat("\r\n\r\n");
+    }
+
+    /*
+    * Retrieve last modified time of the cached file
+    * */
+    private String getCacheLastModifiedTime(String requestAddress) {
+        return this.cacheModifiedTime.get(requestAddress);
+    }
+
+    /*
+     * Get the end of header from input byte array
+     */
     private int getHeaderEnd(byte[] buffer) {
         for (int i = 0; i < buffer.length; i++) {
             if (i <= buffer.length - 4) {
@@ -283,9 +362,8 @@ class ProxyThreadRunnable implements Runnable {
             while ((numResponseBytes = cacheObj.read(buffer)) != -1) {
                 System.out.println("Return from cache " + numResponseBytes + " bytes");
                 responseOutput.write(buffer, 0, numResponseBytes);
+                responseOutput.flush();
             }
-            responseOutput.flush();
-            responseOutput.close();
         } catch (IOException e) {
             System.out.println("Cannot read from file");
             e.printStackTrace();
@@ -293,150 +371,32 @@ class ProxyThreadRunnable implements Runnable {
     }
 
     /*
-    * Cache response to local file and at the same time return to client
+    * Create Cache Directory
     * */
-    private void cacheAndReturnResponse(String reqAddr,
-                                       InputStream forwardInputStream,
-                                       OutputStream serverResponse) throws IOException {
-        File localFile = createCacheFile(reqAddr);
-        OutputStream localFileStream = new FileOutputStream(localFile);
-
-        int numResponseBytes;
-        byte[] buffer = new byte[1024];
-
-        while ((numResponseBytes = forwardInputStream.read(buffer)) != -1) {
-            System.out.println("Receiving and Cache from server " + numResponseBytes + " bytes");
-            localFileStream.write(buffer, 0, numResponseBytes);
-            serverResponse.write(buffer, 0, numResponseBytes);
+    private void createCacheDir() {
+        if (!this.cacheDir.exists()) {
+            System.out.println("====== Create Cache Folder: ProxyCachedFile");
+            this.cacheDir.mkdir();
         }
-        serverResponse.flush();
-        localFileStream.flush();
-
-        // Close local file
-        localFileStream.close();
-        serverResponse.close();
     }
 
     /*
     * Create local file and add to cache list
     * */
-    private File createCacheFile(String cacheRequAddr) throws IOException {
+    private File createCacheFile(String cacheRequAddr, String lastModifiedTime) throws IOException {
 
-        // Create new directory for storing caches
-        File cacheDir = new File("ProxyCachedFile");
-        if (!cacheDir.exists()) {
-            System.out.println("====== Create Cache Folder: ProxyCachedFile");
-            cacheDir.mkdir();
-        }
-
-        String cacheFileAddr = "ProxyCachedFile/" + cacheRequAddr.hashCode();
-
-        // Put filePath into cache hashmap and create new file
+        String cacheFileAddr = "ProxyCachedFile/" + getHashCode(cacheRequAddr);
         this.cache.put(cacheRequAddr, cacheFileAddr);
-        File cacheFile = new File(cacheFileAddr);
+        this.cacheModifiedTime.put(cacheRequAddr, lastModifiedTime);
 
         System.out.println("====== Create Cache File Address at: " + cacheFileAddr);
+        File cacheFile = new File(cacheFileAddr);
         cacheFile.createNewFile();
         return cacheFile;
     }
 
-    /*
-    * Forward clinet request to remote server;
-    * */
-    private void forwardRequest(HTTPMSG clientReqMSG, Socket serverSocket) throws IOException {
-        Header clientReqHeader = clientReqMSG.getHeader();
-        InputStreamReader clientInputReader = clientReqMSG.getbodyReader();
-        OutputStream serverOutput = serverSocket.getOutputStream();
-
-        // Send header in byte array
-        byte[] headerByteArray = clientReqHeader.getHeaderByte();
-        serverOutput.write(headerByteArray, 0, headerByteArray.length);
-
-        // Send message body if request is POST type
-
-        String postBody;
-        if (clientReqHeader.isPost()) {
-            System.out.println("===== Encounter Post Request");
-            while (!(postBody = this.readLine(clientInputReader)).trim().isEmpty()) {
-                System.out.println("===== Send Post Request:\n " + postBody);
-                serverOutput.write(postBody.getBytes());
-            }
-        }
-        serverOutput.flush();
-    }
-
-    /*
-    * Form a HTTPMSG class
-    * */
-    private HTTPMSG formHTTPMSG(Socket socket) throws IOException {
-        InputStream buf_input = socket.getInputStream();
-        InputStreamReader inputReader = new InputStreamReader(buf_input, StandardCharsets.US_ASCII);
-        Header clientRequestHeader = new Header(readHeader(inputReader));
-        return new HTTPMSG(clientRequestHeader, inputReader);
-    }
-
-    /*
-    * Read buffered input stream in lines
-    * */
-    private String readLine(InputStreamReader r) throws IOException {
-        // HTTP carries both textual and binary elements.
-        // Not using BufferedReader.readLine() so it does
-        // not "steal" bytes from BufferedInputStream...
-
-        // HTTP itself only allows 7bit ASCII characters
-        // in headers, but some header values may be
-        // further encoded using RFC 2231 or 5987 to
-        // carry Unicode characters ...
-
-        String[] result = new String[2];
-        StringBuilder sb = new StringBuilder();
-
-        result[1] = "continue";
-        char[] c = new char[1];
-        while (r.ready() && r.read(c) >= 0) {
-            if (c[0] == '\n') break;
-            if (c[0] == '\r') {
-                r.read(c);
-                if ((c[0] < 0) || (c[0] == '\n')) break;
-                sb.append('\r');
-            }
-            sb.append(c);
-        }
-        sb.append('\n');
-        return sb.toString();
-    }
-
-    /*
-    * Read http header into String
-    * */
-    private String readHeader(InputStreamReader input) throws IOException {
-        String header = "";
-        String next;
-        while(!(next = this.readLine(input)).trim().isEmpty()) {
-            header += next;
-        }
-        header += "\r\n";
-
-        return header;
-    }
-
-    /*
-    * Return the remote server response to the client
-    * */
-    private void returnResponse(InputStream serverResponse, OutputStream clientOutput) throws IOException {
-        int numResponseBytes;
-        byte[] buffer = new byte[1024];
-
-        while (((numResponseBytes = serverResponse.read(buffer)) != -1)) {
-            System.out.println("Receiving from server " + numResponseBytes + " bytes");
-            clientOutput.write(buffer, 0, numResponseBytes);
-
-            if ((serverResponse.available() == 0)) {
-                break;
-            }
-        }
-        clientOutput.flush();
-        clientOutput.close();
+    private long getHashCode(String cacheRequAddr) {
+        return cacheRequAddr.hashCode();
     }
 }
 
@@ -454,11 +414,6 @@ class Header {
 
     public String getHeaderStr() {
         return this.rawHeader;
-    }
-
-    /* Header in byte array */
-    public byte[] getHeaderByte() {
-        return this.rawHeader.getBytes(StandardCharsets.US_ASCII);
     }
 
     public boolean isGet() {
@@ -502,6 +457,12 @@ class Header {
         }
     }
 
+    public boolean hasLastModifiedTime() {
+        return getField("Last-Modified:") != null;
+    }
+
+    public String getLastModifiedTime() {return getField("Last-Modified:");}
+
     public String getContentType() {
         return getField("Content-Type:");
     }
@@ -525,7 +486,7 @@ class Header {
         for (int i = 0; i < this.headerList.size(); i++) {
             cur_field = this.headerList.get(i);
             if (cur_field.toUpperCase().startsWith(fieldName.toUpperCase())) {
-                field = (cur_field.split(":")[1]).trim();
+                field = (cur_field.substring(cur_field.indexOf(':') + 1)).trim();
             }
         }
         return field;
@@ -542,30 +503,5 @@ class Header {
             headerList.add(headerArr[i]);
         }
         return headerList;
-    }
-}
-
-
-/*
-* Client Request
-*
-* An abstraction of a client request
-* */
-class HTTPMSG {
-
-    private Header header;
-    private InputStreamReader bodyReader;
-
-    public HTTPMSG(Header header, InputStreamReader inputReader) {
-        this.header = header;
-        this.bodyReader = inputReader;
-    }
-
-    public Header getHeader() {
-        return this.header;
-    }
-
-    public InputStreamReader getbodyReader() {
-        return this.bodyReader;
     }
 }
