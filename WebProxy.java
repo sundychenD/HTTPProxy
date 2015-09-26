@@ -77,6 +77,7 @@ class ProxyThreadRunnable implements Runnable {
     private HashMap<String, String> cache;
     private HashMap<String, String> cacheModifiedTime;
     private OutputStream serverResponse;
+    private InputStream clientInput;
     private File cacheDir;
 
     public ProxyThreadRunnable(Socket socket, HashMap<String, String> cache, HashMap<String, String> cacheModifiedTime) throws IOException {
@@ -85,6 +86,7 @@ class ProxyThreadRunnable implements Runnable {
         this.cacheModifiedTime = cacheModifiedTime;
         this.cacheDir = new File("ProxyCachedFile");
         this.serverResponse = socket.getOutputStream();
+        this.clientInput = this.socket.getInputStream();
 
         createCacheDir();
     }
@@ -96,7 +98,7 @@ class ProxyThreadRunnable implements Runnable {
             while (continueProcess) {
 
                 // Client Stream
-                InputStream clientRequestStream = this.socket.getInputStream();
+                InputStream clientRequestStream = this.clientInput;
                 OutputStream clientOutputStream = this.serverResponse;
                 // Server Stream
                 Socket serverSocket = null;
@@ -263,6 +265,19 @@ class ProxyThreadRunnable implements Runnable {
         } catch (IOException e) {
             System.out.println(e.getMessage());
             e.printStackTrace();
+
+            // Return bad request
+            String badRequest502 = "HTTP/1.0 502 Bad Gateway\r\n\r\n502 Bad Request\r\n";
+            byte[] badRequestByteArray = badRequest502.getBytes();
+
+            try {
+                this.serverResponse.write(badRequestByteArray, 0, badRequestByteArray.length);
+                this.serverResponse.flush();
+                this.socket.close();
+            } catch (IOException e1) {
+                System.out.println(e.getMessage());
+                e1.printStackTrace();
+            }
         } catch (InterruptedException e) {
             e.printStackTrace();
         }
